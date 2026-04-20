@@ -49,17 +49,29 @@ contribute to total travel time and total distance.
 ================================================================================
 BIDIMENSIONAL MODEL APPLICATION
 ================================================================================
-For each OD pair we compute:
+For each OD pair we split the OTP total duration into two buckets to avoid
+double-counting:
 
-  access_time      = ACCESS_TIME_HOURS  (assumed wait/access at first stop)
-  travel_time      = sum of in-vehicle + walking-leg durations from OTP
-  total_distance   = sum of leg distances (miles)
-  fixed_cost       = total fare from the leg-by-leg fare engine ($)
-  variable_cost    = $0/mile  (transit fare is not distance-priced once on)
+  access_time    = duration of the FIRST foot leg only (origin -> first stop).
+                   If the first leg is not a foot leg, access_time = 0.
+  travel_time    = total_duration - access_time, i.e. in-vehicle time + any
+                   transfer-walk legs + the last-mile (egress) foot leg.
+                   Transfer walks are part of travel_time because they happen
+                   between vehicles, not before boarding the first one.
+  total_distance = sum of all leg distances (miles) = OTP total_distance_miles
+  fixed_cost     = total fare from the leg-by-leg fare engine ($)
+  variable_cost  = $0/mile  (transit fare is not distance-priced once on)
 
-  generalized_time  = access_time + travel_time + (fixed_cost / VoT)
-                                                 + (variable_cost * d / VoT)
-  generalized_speed = total_distance / generalized_time
+Formulas (units: miles, hours, $):
+
+  generalized_speed = (distance * VoT) /
+                      (VoT*(access_time + travel_time) + fixed_cost
+                       + variable_cost * distance)
+  generalized_time  = access_time + (distance / modal_speed)
+                      + (fixed_cost / VoT) + (variable_cost * distance / VoT)
+
+  where modal_speed = distance / travel_time  (so distance / modal_speed
+  is just travel_time; the two formulas are equivalent).
 
 ================================================================================
 DATA SOURCES
@@ -100,9 +112,12 @@ import pandas as pd
 # =============================================================================
 
 # --- Bidimensional model parameters ---
-ACCESS_TIME_MINS = 5                              # minutes — initial wait/access
-ACCESS_TIME_HOURS = ACCESS_TIME_MINS / 60.0
-VARIABLE_COST_PER_MILE = 0.00                     # transit fare not per-mile
+# Access time is computed PER TRIP from the first foot leg (see summarize_trip);
+# this module-level constant is only the fallback for CSV-only rows that have
+# no leg breakdown available.
+ACCESS_TIME_MINS_FALLBACK = 0                      # minutes
+ACCESS_TIME_HOURS_FALLBACK = ACCESS_TIME_MINS_FALLBACK / 60.0
+VARIABLE_COST_PER_MILE = 0.00                      # transit fare not per-mile
 
 # --- VoT income brackets ($/hour) -- match car/bike/walk scripts ---
 VOT_LEVELS: Dict[str, float] = {
@@ -666,7 +681,8 @@ METERS_PER_MILE = 1609.344
 @dataclass
 class TripSummary:
     distance_miles: float
-    travel_time_mins: float
+    access_time_mins: float      # first foot leg only (origin -> first stop)
+    travel_time_mins: float      # total - access (in-vehicle + transfer + egress walks)
     fare: float
     boardings: int
     transfers_used: int
@@ -701,6 +717,17 @@ def summarize_trip(pattern: Optional[dict],
         if total_m <= 0 or total_sec <= 0:
             return None
 
+        # Access time = duration of the FIRST foot leg only (origin -> first stop).
+        # If the first leg is not a walking leg, access = 0 and the whole trip is
+        # travel_time. Transfer walks (foot legs that are not leg[0]) and the
+        # final egress walk are intentionally NOT counted as access; they are
+        # part of travel_time because they happen inter-vehicle or post-egress.
+        access_sec = 0.0
+        if legs and classify_leg(legs[0]) == "walk":
+            access_sec = leg_dur_sec(legs[0])
+
+        travel_sec = max(total_sec - access_sec, 0.0)
+
         fb = compute_trip_fare(legs, metra_stations)
         seq = "|".join(classify_leg(l) for l in legs) if legs else ""
 
@@ -711,7 +738,8 @@ def summarize_trip(pattern: Optional[dict],
 
         return TripSummary(
             distance_miles=float(miles),
-            travel_time_mins=total_sec / 60.0,
+            access_time_mins=access_sec / 60.0,
+            travel_time_mins=travel_sec / 60.0,
             fare=fb.total_fare,
             boardings=fb.boardings,
             transfers_used=fb.transfers_used,
@@ -720,10 +748,11 @@ def summarize_trip(pattern: Optional[dict],
             leg_sequence=seq,
         )
 
-    # Fallback to CSV-only
+    # Fallback to CSV-only (no leg detail, so we cannot split access from travel)
     if csv_distance_miles and csv_time_mins and csv_distance_miles > 0 and csv_time_mins > 0:
         return TripSummary(
             distance_miles=float(csv_distance_miles),
+            access_time_mins=float(ACCESS_TIME_MINS_FALLBACK),
             travel_time_mins=float(csv_time_mins),
             fare=CTA_RAIL_FARE,           # conservative default
             boardings=1,
@@ -777,7 +806,9 @@ def build_dataframe(json_pairs: Dict[Tuple[float, float], dict],
             rows.append({
                 "origin_taz": o, "destination_taz": d,
                 "is_valid": False, "invalid_reason": "no usable trip data",
-                "travel_distance_miles": np.nan, "travel_time_mins": np.nan,
+                "travel_distance_miles": np.nan,
+                "access_time_mins": np.nan,
+                "travel_time_mins": np.nan,
                 "fare": np.nan, "boardings": 0, "transfers_used": 0,
                 "fare_detail": "", "fare_estimated": False,
                 "leg_sequence": "",
@@ -787,6 +818,7 @@ def build_dataframe(json_pairs: Dict[Tuple[float, float], dict],
                 "origin_taz": o, "destination_taz": d,
                 "is_valid": True, "invalid_reason": "",
                 "travel_distance_miles": ts.distance_miles,
+                "access_time_mins": ts.access_time_mins,
                 "travel_time_mins": ts.travel_time_mins,
                 "fare": ts.fare,
                 "boardings": ts.boardings,
@@ -806,8 +838,11 @@ def calculate_generalized_metrics(df: pd.DataFrame,
     """
     print("\nCalculating generalized metrics...")
     df = df.copy()
+    df["access_time_hours"] = df["access_time_mins"] / 60.0
     df["travel_time_hours"] = df["travel_time_mins"] / 60.0
     df["dest_classification"] = df["destination_taz"].map(zone_classifications).fillna("Unknown")
+    # modal_speed = distance / travel_time (travel_time excludes access, as
+    # prescribed by the bidimensional model)
     df["modal_speed_mph"] = np.where(
         df["is_valid"] & (df["travel_time_hours"] > 0),
         df["travel_distance_miles"] / df["travel_time_hours"],
@@ -817,13 +852,28 @@ def calculate_generalized_metrics(df: pd.DataFrame,
     for vot_name, vot in vot_levels.items():
         gt_col = f"generalized_time_hours_{vot_name}"
         gs_col = f"generalized_speed_mph_{vot_name}"
+
+        # generalized_time = access_time + (distance / modal_speed)
+        #                    + (fixed_cost / VoT) + (variable_cost * distance / VoT)
+        # Since distance / modal_speed == travel_time, this is equivalent to
+        #   access_time + travel_time + fare/VoT + var*d/VoT
         df[gt_col] = (
-            ACCESS_TIME_HOURS
+            df["access_time_hours"]
             + df["travel_time_hours"]
             + (df["fare"] / vot)
             + (VARIABLE_COST_PER_MILE * df["travel_distance_miles"] / vot)
         )
-        df[gs_col] = df["travel_distance_miles"] / df[gt_col]
+
+        # generalized_speed = (distance * VoT) /
+        #   (VoT*(access + travel) + fixed + variable*distance)
+        denom = (
+            vot * (df["access_time_hours"] + df["travel_time_hours"])
+            + df["fare"]
+            + VARIABLE_COST_PER_MILE * df["travel_distance_miles"]
+        )
+        df[gs_col] = np.where(denom > 0,
+                              (df["travel_distance_miles"] * vot) / denom,
+                              np.nan)
         df.loc[~df["is_valid"], [gt_col, gs_col]] = np.nan
     return df
 
@@ -839,7 +889,8 @@ def save_outputs(df: pd.DataFrame, output_dir: str):
     valid = df[df["is_valid"]].copy()
     essential = [
         "origin_taz", "destination_taz", "dest_classification",
-        "travel_distance_miles", "travel_time_mins", "modal_speed_mph",
+        "travel_distance_miles",
+        "access_time_mins", "travel_time_mins", "modal_speed_mph",
         "fare", "boardings", "transfers_used", "fare_estimated",
         "leg_sequence",
     ]
@@ -873,6 +924,7 @@ def generate_statistics(df: pd.DataFrame):
     print(f"Mean fare:             ${valid['fare'].mean():.2f}")
     print(f"Median fare:           ${valid['fare'].median():.2f}")
     print(f"Max fare:              ${valid['fare'].max():.2f}")
+    print(f"Mean access time:      {valid['access_time_mins'].mean():.1f} min")
     print(f"Mean travel time:      {valid['travel_time_mins'].mean():.1f} min")
     print(f"Mean modal speed:      {valid['modal_speed_mph'].mean():.2f} mph")
     for vot_name, vot in VOT_LEVELS.items():
@@ -907,7 +959,8 @@ def main():
     print("Bidimensional Transportation Model (Khisty & Sriraj)")
     print("=" * 80)
     print(f"\n--- Parameters ---")
-    print(f"Access time:        {ACCESS_TIME_MINS} min")
+    print(f"Access time:        per-trip (first foot leg duration; fallback "
+          f"{ACCESS_TIME_MINS_FALLBACK} min for CSV-only rows)")
     print(f"Variable cost:      ${VARIABLE_COST_PER_MILE}/mile (transit fare not per-mile)")
     print(f"VoT levels:         {VOT_LEVELS}")
     print(f"Transfer window:    {TRANSFER_WINDOW_HOURS} hours, max {MAX_TRANSFERS} transfers")
