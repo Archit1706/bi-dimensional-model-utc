@@ -85,7 +85,9 @@ import argparse
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -177,6 +179,26 @@ AGENCY_MAP = {
 WALK_LEG_MODES = {"WALK", "FOOT"}
 
 
+def _leg_transit_info(leg: dict) -> dict:
+    return leg.get("transit_info") or leg.get("route") or {}
+
+
+def _leg_agency(leg: dict) -> str:
+    ti = _leg_transit_info(leg)
+    # New schema: transit_info.authority_name / authority_id
+    agency = ti.get("authority_name") or ""
+    if not agency:
+        # Legacy shape: route.agency.name
+        agency = (ti.get("agency") or {}).get("name", "") if isinstance(ti.get("agency"), dict) else ""
+    if not agency:
+        # Infer from authority_id prefix (e.g. 'cta:50066', 'metra:...', 'pace:...')
+        aid = (ti.get("authority_id") or "").lower()
+        if aid.startswith("cta"):   return "Chicago Transit Authority"
+        if aid.startswith("metra"): return "Metra"
+        if aid.startswith("pace"):  return "Pace"
+    return agency
+
+
 def classify_leg(leg: dict) -> str:
     """
     Normalize an OTP leg into one of:
@@ -186,39 +208,49 @@ def classify_leg(leg: dict) -> str:
     if mode in WALK_LEG_MODES:
         return "walk"
 
-    # Best-effort agency lookup
-    route = leg.get("route") or {}
-    agency = (route.get("agency") or {}).get("name", "") or ""
+    agency = _leg_agency(leg)
     by_agency = AGENCY_MAP.get(agency)
     if by_agency:
-        return by_agency.get(mode, "unknown_transit")
+        mapped = by_agency.get(mode)
+        if mapped:
+            return mapped
 
-    # Fallback: try matching common short names
-    short = (route.get("shortName") or "").upper()
-    long_name = (route.get("longName") or "").upper()
+    # Fallbacks
+    ti = _leg_transit_info(leg)
+    long_name = (ti.get("line_name") or ti.get("longName") or "").upper()
     if "METRA" in agency.upper() or "METRA" in long_name:
         return "metra_rail"
     if "PACE" in agency.upper():
         return "pace_bus"
-    if mode in ("RAIL", "SUBWAY", "TRAM"):
+    if mode in ("RAIL", "SUBWAY", "TRAM", "METRO"):
         return "cta_rail"
     if mode == "BUS":
         return "cta_bus"
     return "unknown_transit"
 
 
+def _leg_from_name(leg: dict) -> str:
+    fp = leg.get("from_place") or leg.get("from") or {}
+    return (fp.get("name") or "").upper()
+
+
+def _leg_to_name(leg: dict) -> str:
+    tp = leg.get("to_place") or leg.get("to") or {}
+    return (tp.get("name") or "").upper()
+
+
 def is_ohare_boarding(leg: dict) -> bool:
-    name = ((leg.get("from") or {}).get("name") or "").upper()
+    name = _leg_from_name(leg)
     if not name:
         return False
     return any(kw in name for kw in OHARE_STATION_KEYWORDS)
 
 
 def is_pace_express(leg: dict) -> bool:
-    route = leg.get("route") or {}
+    ti = _leg_transit_info(leg)
     text = " ".join([
-        str(route.get("shortName") or ""),
-        str(route.get("longName")  or ""),
+        str(ti.get("line_public_code") or ti.get("shortName") or ""),
+        str(ti.get("line_name")        or ti.get("longName")  or ""),
     ]).upper()
     return any(kw in text for kw in PACE_EXPRESS_KEYWORDS)
 
@@ -252,6 +284,13 @@ class MetraStation:
     taz: Optional[float]
     lat: Optional[float] = None
     lon: Optional[float] = None
+    name_norm: str = ""
+
+
+def _norm_station_name(s: str) -> str:
+    s = (s or "").upper()
+    s = re.sub(r"[^A-Z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def load_metra_stations(stations_path: str,
@@ -297,13 +336,15 @@ def load_metra_stations(stations_path: str,
             continue  # cannot price without a zone
 
         latlon = centroid_lookup.get(zone17, (None, None))
+        name = str(r.get("LONGNAME") or r.get("SHORTNAME") or "")
         stations.append(MetraStation(
             station_id=int(r.get("STATION_ID", 0) or 0),
-            name=str(r.get("LONGNAME") or r.get("SHORTNAME") or ""),
+            name=name,
             farezone=farezone,
             taz=zone17,
             lat=latlon[0],
             lon=latlon[1],
+            name_norm=_norm_station_name(name),
         ))
     print(f"  Loaded {len(stations)} Metra stations "
           f"({sum(1 for s in stations if s.lat is not None)} with coords)")
@@ -331,6 +372,37 @@ def nearest_metra_zone(lat: Optional[float], lon: Optional[float],
         d = _haversine_miles(lat, lon, s.lat, s.lon)
         if d < best_d:
             best_d, best = d, s
+    return best.farezone if best is not None else None
+
+
+def metra_zone_for_leg_endpoint(name: str,
+                                stations: List[MetraStation]) -> Optional[int]:
+    """
+    Resolve a Metra fare zone from a station NAME (e.g. 'Schiller Park',
+    'Geneva'). Used because the OTP transit JSON exposes only stop name +
+    quay_id (no lat/lon) on the leg endpoints.
+
+    Strategy: normalize and look for the station whose name appears in,
+    or contains, the leg's place name. Returns None if no confident match.
+    """
+    if not name or not stations:
+        return None
+    n = _norm_station_name(name)
+    if not n:
+        return None
+    # Exact match first
+    for s in stations:
+        if s.name_norm and s.name_norm == n:
+            return s.farezone
+    # Substring match (leg name contains station, or vice-versa)
+    best = None
+    best_len = 0
+    for s in stations:
+        if not s.name_norm:
+            continue
+        if s.name_norm in n or n in s.name_norm:
+            if len(s.name_norm) > best_len:
+                best, best_len = s, len(s.name_norm)
     return best.farezone if best is not None else None
 
 
@@ -364,13 +436,19 @@ def compute_trip_fare(legs: List[dict],
     last_leg_end_time_sec = None
 
     def leg_start_sec(leg: dict) -> Optional[float]:
-        # OTP exposes startTime/endTime in ms (epoch); fall back to None.
-        for key in ("startTime", "from"):
+        # New schema: ISO 8601 strings in 'expected_start_time'/'aimed_start_time'
+        for key in ("expected_start_time", "aimed_start_time"):
+            v = leg.get(key)
+            if isinstance(v, str):
+                try:
+                    return datetime.fromisoformat(v).timestamp()
+                except ValueError:
+                    continue
+        # Legacy: epoch ms
+        for key in ("startTime",):
             v = leg.get(key)
             if isinstance(v, (int, float)):
                 return v / 1000.0
-            if isinstance(v, dict) and isinstance(v.get("departure"), (int, float)):
-                return v["departure"] / 1000.0
         return None
 
     def within_window(now_sec: Optional[float]) -> bool:
@@ -389,16 +467,24 @@ def compute_trip_fare(legs: List[dict],
 
         if kind == "metra_rail":
             # Metra is always its own full-fare ticket on one-way.
-            zone_from = nearest_metra_zone(
-                (leg.get("from") or {}).get("lat"),
-                (leg.get("from") or {}).get("lon"),
-                metra_stations,
-            )
-            zone_to = nearest_metra_zone(
-                (leg.get("to") or {}).get("lat"),
-                (leg.get("to") or {}).get("lon"),
-                metra_stations,
-            )
+            # Try station-name match first (new OTP schema lacks lat/lon on legs);
+            # fall back to coordinate-based nearest-station if available.
+            from_name = _leg_from_name(leg)
+            to_name   = _leg_to_name(leg)
+            zone_from = metra_zone_for_leg_endpoint(from_name, metra_stations)
+            zone_to   = metra_zone_for_leg_endpoint(to_name,   metra_stations)
+            if zone_from is None:
+                zone_from = nearest_metra_zone(
+                    (leg.get("from") or {}).get("lat"),
+                    (leg.get("from") or {}).get("lon"),
+                    metra_stations,
+                )
+            if zone_to is None:
+                zone_to = nearest_metra_zone(
+                    (leg.get("to") or {}).get("lat"),
+                    (leg.get("to") or {}).get("lon"),
+                    metra_stations,
+                )
             fare = metra_fare(zone_from, zone_to)
             fb.total_fare += fare
             fb.boardings += 1
@@ -484,12 +570,22 @@ def load_transit_pairs_from_json(dirs: Iterable[str]) -> Dict[Tuple[float, float
         files_seen += 1
         try:
             with open(jpath, "r", encoding="utf-8") as fh:
-                records = json.load(fh)
+                payload = json.load(fh)
         except (OSError, json.JSONDecodeError) as e:
             print(f"  [warn] could not read {jpath.name}: {e}")
             continue
 
+        # Support both schemas: {trip_data: [...]} (current) and bare list (legacy)
+        if isinstance(payload, dict):
+            records = payload.get("trip_data") or payload.get("results") or []
+        elif isinstance(payload, list):
+            records = payload
+        else:
+            continue
+
         for rec in records:
+            if not isinstance(rec, dict):
+                continue
             mode = (rec.get("mode") or "").lower()
             if mode not in {"transit", "bus", "rail"}:
                 continue
@@ -498,14 +594,20 @@ def load_transit_pairs_from_json(dirs: Iterable[str]) -> Dict[Tuple[float, float
             patterns = rec.get("trip_patterns") or []
             if not patterns:
                 continue
-            key = (rec.get("origin_taz"), rec.get("dest_taz"))
+            o = rec.get("origin_zone")  if "origin_zone"  in rec else rec.get("origin_taz")
+            d = rec.get("destination_zone") if "destination_zone" in rec else rec.get("dest_taz")
+            if o is None or d is None:
+                continue
+            key = (o, d)
             if key in out:
                 continue  # earlier (higher-priority) directory already populated
             best = patterns[0]
             out[key] = {
-                "duration_sec": best.get("duration"),
-                "distance_m":   best.get("distance"),
-                "legs":         best.get("legs") or [],
+                # New schema field names; fall back to legacy names
+                "duration_sec":  best.get("total_duration_seconds")  or best.get("duration"),
+                "distance_m":    best.get("total_distance_meters")   or best.get("distance"),
+                "distance_miles": best.get("total_distance_miles"),
+                "legs":          best.get("legs") or [],
             }
             pairs_seen += 1
 
@@ -584,13 +686,17 @@ def summarize_trip(pattern: Optional[dict],
     """
     if pattern is not None:
         legs = pattern.get("legs") or []
-        # Distance: prefer summed leg distances; fall back to pattern distance
-        leg_dist_m = sum((l.get("distance") or 0.0) for l in legs)
-        total_m = leg_dist_m if leg_dist_m > 0 else (pattern.get("distance_m") or 0.0)
-        # Time: prefer pattern duration; fall back to summed leg duration
-        total_sec = pattern.get("duration_sec") or sum(
-            (l.get("duration") or 0.0) for l in legs
-        )
+
+        def leg_dist_m(l):
+            return l.get("distance_meters") or l.get("distance") or 0.0
+
+        def leg_dur_sec(l):
+            return l.get("duration_seconds") or l.get("duration") or 0.0
+
+        # Distance: prefer pattern total; else sum legs
+        total_m = pattern.get("distance_m") or sum(leg_dist_m(l) for l in legs)
+        # Time: prefer pattern duration; else sum legs
+        total_sec = pattern.get("duration_sec") or sum(leg_dur_sec(l) for l in legs)
 
         if total_m <= 0 or total_sec <= 0:
             return None
@@ -598,8 +704,13 @@ def summarize_trip(pattern: Optional[dict],
         fb = compute_trip_fare(legs, metra_stations)
         seq = "|".join(classify_leg(l) for l in legs) if legs else ""
 
+        # Prefer the precomputed miles when present (avoids rounding drift)
+        miles = pattern.get("distance_miles")
+        if miles is None:
+            miles = total_m / METERS_PER_MILE
+
         return TripSummary(
-            distance_miles=total_m / METERS_PER_MILE,
+            distance_miles=float(miles),
             travel_time_mins=total_sec / 60.0,
             fare=fb.total_fare,
             boardings=fb.boardings,
