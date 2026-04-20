@@ -162,8 +162,7 @@ METRA_FARE_NON_Z1       = 3.75
 OHARE_STATION_KEYWORDS = ("O'HARE", "OHARE", "O HARE")
 
 # --- Default file paths (overridable on the CLI) ---
-DEFAULT_TAZ_FILE        = "taz.xlsx"
-DEFAULT_TAZ_CENTROID    = "TAZ_OTP/data/taz_new2.csv"
+DEFAULT_TAZ_FILE        = "taz_new.csv"   # zone17, chicago, cbd, Lat, Lon
 DEFAULT_METRA_STATIONS  = "transit_meta/metrastations_taz.xls"
 DEFAULT_TRANSIT_CSV     = "TAZ_OTP/data/csv/travel_time_transit.csv"
 DEFAULT_JSON_DIRS       = [
@@ -332,13 +331,17 @@ def load_metra_stations(stations_path: str,
 
     centroid_lookup: Dict[float, Tuple[float, float]] = {}
     if taz_centroid_path and os.path.exists(taz_centroid_path):
-        cdf = pd.read_csv(taz_centroid_path)
-        for _, r in cdf.iterrows():
-            try:
-                centroid_lookup[float(r["zone17"])] = (float(r["Lat"]),
-                                                       float(r["Lon"]))
-            except (KeyError, ValueError, TypeError):
-                continue
+        if taz_centroid_path.lower().endswith(".csv"):
+            cdf = pd.read_csv(taz_centroid_path)
+        else:
+            cdf = pd.read_excel(taz_centroid_path, sheet_name=0)
+        if "Lat" in cdf.columns and "Lon" in cdf.columns:
+            for _, r in cdf.iterrows():
+                try:
+                    centroid_lookup[float(r["zone17"])] = (float(r["Lat"]),
+                                                           float(r["Lon"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
 
     for _, r in df.iterrows():
         try:
@@ -939,9 +942,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="Transit bidimensional generalized speed/time calculator")
     ap.add_argument("--taz-file",       default=DEFAULT_TAZ_FILE,
-                    help="TAZ classification (xlsx or csv with zone17/chicago/cbd)")
-    ap.add_argument("--taz-centroids",  default=DEFAULT_TAZ_CENTROID,
-                    help="taz_new2.csv with zone17/Lat/Lon (used for Metra station coords)")
+                    help="TAZ reference file (csv or xlsx) with columns "
+                         "zone17, chicago, cbd, Lat, Lon. Supplies both the "
+                         "destination-zone classification and the centroids "
+                         "used for Metra station coordinate lookup.")
     ap.add_argument("--metra-stations", default=DEFAULT_METRA_STATIONS,
                     help="metrastations_taz.xls (STATION_ID, FAREZONE, zone17, ...)")
     ap.add_argument("--transit-csv",    default=DEFAULT_TRANSIT_CSV,
@@ -975,7 +979,7 @@ def main():
     if not zone_class:
         print(f"  [warn] TAZ classifications not loaded from {args.taz_file}; "
               "destinations will be marked 'Unknown'.")
-    metra_stations = load_metra_stations(args.metra_stations, args.taz_centroids)
+    metra_stations = load_metra_stations(args.metra_stations, args.taz_file)
 
     print("\n--- Loading OTP JSON ---")
     json_pairs = load_transit_pairs_from_json(json_dirs)
