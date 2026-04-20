@@ -94,10 +94,12 @@ Outputs (in --output-dir, default 'output/'):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -571,66 +573,41 @@ def _iter_json_files(dirs: Iterable[str]) -> Iterable[Path]:
             yield f
 
 
-def load_transit_pairs_from_json(dirs: Iterable[str]) -> Dict[Tuple[float, float], dict]:
-    """
-    Walk every JSON file in the given dirs (in order — earlier dirs win on
-    duplicate keys, matching combine_json_to_csv.py precedence) and return a
-    {(origin_taz, dest_taz): best_trip_pattern_with_metadata} dict.
+def _iter_records(payload) -> Iterable[dict]:
+    """Yield trip records from either {trip_data:[...]} (current) or bare-list (legacy)."""
+    if isinstance(payload, dict):
+        records = payload.get("trip_data") or payload.get("results") or []
+    elif isinstance(payload, list):
+        records = payload
+    else:
+        return
+    for rec in records:
+        if isinstance(rec, dict):
+            yield rec
 
-    Filters to entries with mode in {transit, bus, rail}. The first non-empty
-    trip_patterns[0] for an OD pair is treated as the 'best' pattern.
-    """
-    out: Dict[Tuple[float, float], dict] = {}
-    files_seen = 0
-    pairs_seen = 0
 
-    for jpath in _iter_json_files(dirs):
-        files_seen += 1
-        try:
-            with open(jpath, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"  [warn] could not read {jpath.name}: {e}")
-            continue
+def _extract_pattern(rec: dict) -> Optional[dict]:
+    """Return a normalized pattern-summary dict from a trip record, or None."""
+    if (rec.get("mode") or "").lower() not in {"transit", "bus", "rail"}:
+        return None
+    if not rec.get("success"):
+        return None
+    patterns = rec.get("trip_patterns") or []
+    if not patterns:
+        return None
+    best = patterns[0]
+    return {
+        "duration_sec":   best.get("total_duration_seconds") or best.get("duration"),
+        "distance_m":     best.get("total_distance_meters")  or best.get("distance"),
+        "distance_miles": best.get("total_distance_miles"),
+        "legs":           best.get("legs") or [],
+    }
 
-        # Support both schemas: {trip_data: [...]} (current) and bare list (legacy)
-        if isinstance(payload, dict):
-            records = payload.get("trip_data") or payload.get("results") or []
-        elif isinstance(payload, list):
-            records = payload
-        else:
-            continue
 
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
-            mode = (rec.get("mode") or "").lower()
-            if mode not in {"transit", "bus", "rail"}:
-                continue
-            if not rec.get("success"):
-                continue
-            patterns = rec.get("trip_patterns") or []
-            if not patterns:
-                continue
-            o = rec.get("origin_zone")  if "origin_zone"  in rec else rec.get("origin_taz")
-            d = rec.get("destination_zone") if "destination_zone" in rec else rec.get("dest_taz")
-            if o is None or d is None:
-                continue
-            key = (o, d)
-            if key in out:
-                continue  # earlier (higher-priority) directory already populated
-            best = patterns[0]
-            out[key] = {
-                # New schema field names; fall back to legacy names
-                "duration_sec":  best.get("total_duration_seconds")  or best.get("duration"),
-                "distance_m":    best.get("total_distance_meters")   or best.get("distance"),
-                "distance_miles": best.get("total_distance_miles"),
-                "legs":          best.get("legs") or [],
-            }
-            pairs_seen += 1
-
-    print(f"  Scanned {files_seen} JSON file(s); collected {len(out)} OD pairs")
-    return out
+def _record_od(rec: dict) -> Tuple[Optional[float], Optional[float]]:
+    o = rec.get("origin_zone")      if "origin_zone"      in rec else rec.get("origin_taz")
+    d = rec.get("destination_zone") if "destination_zone" in rec else rec.get("dest_taz")
+    return o, d
 
 
 # =============================================================================
@@ -771,171 +748,309 @@ def summarize_trip(pattern: Optional[dict],
 # MAIN PIPELINE
 # =============================================================================
 
-def build_dataframe(json_pairs: Dict[Tuple[float, float], dict],
-                    csv_path: Optional[str],
-                    metra_stations: List[MetraStation]) -> pd.DataFrame:
-    """
-    Build the per-OD-pair dataframe by iterating the union of JSON keys and
-    CSV rows. CSV rows without JSON get the fallback fare estimate.
-    """
-    csv_index: Dict[Tuple[float, float], Tuple[float, float]] = {}
-    if csv_path and os.path.exists(csv_path):
-        print(f"\nLoading transit CSV fallback: {csv_path}")
-        cdf = pd.read_csv(csv_path)
-        # Accept either {origin_taz,dest_taz,distance_miles,travel_time_min}
-        # or the bidim convention {origin_taz,destination_taz,
-        #                          travel_distance_miles,travel_time_mins}
-        col_o = "origin_taz"
-        col_d = "destination_taz" if "destination_taz" in cdf.columns else "dest_taz"
-        col_dist = ("travel_distance_miles" if "travel_distance_miles" in cdf.columns
-                    else "distance_miles")
-        col_time = ("travel_time_mins" if "travel_time_mins" in cdf.columns
-                    else "travel_time_min")
-        for _, r in cdf.iterrows():
-            csv_index[(r[col_o], r[col_d])] = (r.get(col_dist), r.get(col_time))
-        print(f"  CSV holds {len(csv_index)} OD pairs")
-    else:
-        print("\n[info] No transit CSV provided; using JSON-only OD pairs.")
+def _build_row(o, d, ts: Optional[TripSummary],
+               zone_classifications: Dict[float, str],
+               vot_levels: Dict[str, float]) -> Dict[str, object]:
+    """Build a single CSV row (all fields already resolved to scalars)."""
+    dest_cls = zone_classifications.get(d, "Unknown")
+    row: Dict[str, object] = {
+        "origin_taz": o,
+        "destination_taz": d,
+        "dest_classification": dest_cls,
+    }
+    if ts is None:
+        row.update({
+            "is_valid": False,
+            "invalid_reason": "no usable trip data",
+            "travel_distance_miles": "",
+            "access_time_mins": "",
+            "travel_time_mins": "",
+            "modal_speed_mph": "",
+            "fare": "",
+            "boardings": 0,
+            "transfers_used": 0,
+            "fare_detail": "",
+            "fare_estimated": False,
+            "leg_sequence": "",
+        })
+        for vot_name in vot_levels:
+            row[f"generalized_time_hours_{vot_name}"] = ""
+            row[f"generalized_speed_mph_{vot_name}"] = ""
+        return row
 
-    keys = set(json_pairs.keys()) | set(csv_index.keys())
-    print(f"\nProcessing {len(keys)} unique OD pairs...")
+    dist   = ts.distance_miles
+    acc_h  = ts.access_time_mins / 60.0
+    trav_h = ts.travel_time_mins / 60.0
+    modal_speed = (dist / trav_h) if trav_h > 0 else None
 
-    rows = []
-    for (o, d) in keys:
-        pattern = json_pairs.get((o, d))
-        cdist, ctime = csv_index.get((o, d), (None, None))
-        ts = summarize_trip(pattern, metra_stations, cdist, ctime)
-        if ts is None:
-            rows.append({
-                "origin_taz": o, "destination_taz": d,
-                "is_valid": False, "invalid_reason": "no usable trip data",
-                "travel_distance_miles": np.nan,
-                "access_time_mins": np.nan,
-                "travel_time_mins": np.nan,
-                "fare": np.nan, "boardings": 0, "transfers_used": 0,
-                "fare_detail": "", "fare_estimated": False,
-                "leg_sequence": "",
-            })
-        else:
-            rows.append({
-                "origin_taz": o, "destination_taz": d,
-                "is_valid": True, "invalid_reason": "",
-                "travel_distance_miles": ts.distance_miles,
-                "access_time_mins": ts.access_time_mins,
-                "travel_time_mins": ts.travel_time_mins,
-                "fare": ts.fare,
-                "boardings": ts.boardings,
-                "transfers_used": ts.transfers_used,
-                "fare_detail": ts.fare_detail,
-                "fare_estimated": ts.fare_estimated,
-                "leg_sequence": ts.leg_sequence,
-            })
-    return pd.DataFrame(rows)
-
-
-def calculate_generalized_metrics(df: pd.DataFrame,
-                                  zone_classifications: Dict[float, str],
-                                  vot_levels: Dict[str, float]) -> pd.DataFrame:
-    """
-    Apply the bidimensional model. fixed_cost = trip fare ($).
-    """
-    print("\nCalculating generalized metrics...")
-    df = df.copy()
-    df["access_time_hours"] = df["access_time_mins"] / 60.0
-    df["travel_time_hours"] = df["travel_time_mins"] / 60.0
-    df["dest_classification"] = df["destination_taz"].map(zone_classifications).fillna("Unknown")
-    # modal_speed = distance / travel_time (travel_time excludes access, as
-    # prescribed by the bidimensional model)
-    df["modal_speed_mph"] = np.where(
-        df["is_valid"] & (df["travel_time_hours"] > 0),
-        df["travel_distance_miles"] / df["travel_time_hours"],
-        np.nan,
-    )
-
+    row.update({
+        "is_valid": True,
+        "invalid_reason": "",
+        "travel_distance_miles": dist,
+        "access_time_mins": ts.access_time_mins,
+        "travel_time_mins": ts.travel_time_mins,
+        "modal_speed_mph": modal_speed if modal_speed is not None else "",
+        "fare": ts.fare,
+        "boardings": ts.boardings,
+        "transfers_used": ts.transfers_used,
+        "fare_detail": ts.fare_detail,
+        "fare_estimated": ts.fare_estimated,
+        "leg_sequence": ts.leg_sequence,
+    })
     for vot_name, vot in vot_levels.items():
-        gt_col = f"generalized_time_hours_{vot_name}"
-        gs_col = f"generalized_speed_mph_{vot_name}"
-
-        # generalized_time = access_time + (distance / modal_speed)
-        #                    + (fixed_cost / VoT) + (variable_cost * distance / VoT)
-        # Since distance / modal_speed == travel_time, this is equivalent to
-        #   access_time + travel_time + fare/VoT + var*d/VoT
-        df[gt_col] = (
-            df["access_time_hours"]
-            + df["travel_time_hours"]
-            + (df["fare"] / vot)
-            + (VARIABLE_COST_PER_MILE * df["travel_distance_miles"] / vot)
-        )
-
-        # generalized_speed = (distance * VoT) /
-        #   (VoT*(access + travel) + fixed + variable*distance)
-        denom = (
-            vot * (df["access_time_hours"] + df["travel_time_hours"])
-            + df["fare"]
-            + VARIABLE_COST_PER_MILE * df["travel_distance_miles"]
-        )
-        df[gs_col] = np.where(denom > 0,
-                              (df["travel_distance_miles"] * vot) / denom,
-                              np.nan)
-        df.loc[~df["is_valid"], [gt_col, gs_col]] = np.nan
-    return df
+        gt = acc_h + trav_h + (ts.fare / vot) + (VARIABLE_COST_PER_MILE * dist / vot)
+        denom = vot * (acc_h + trav_h) + ts.fare + VARIABLE_COST_PER_MILE * dist
+        gs = (dist * vot) / denom if denom > 0 else None
+        row[f"generalized_time_hours_{vot_name}"] = gt
+        row[f"generalized_speed_mph_{vot_name}"]  = gs if gs is not None else ""
+    return row
 
 
-def save_outputs(df: pd.DataFrame, output_dir: str):
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def _output_columns(vot_levels: Dict[str, float]) -> Tuple[List[str], List[str]]:
+    """(full_columns, clean_columns)"""
+    full = [
+        "origin_taz", "destination_taz", "dest_classification",
+        "is_valid", "invalid_reason",
+        "travel_distance_miles",
+        "access_time_mins", "travel_time_mins", "modal_speed_mph",
+        "fare", "boardings", "transfers_used",
+        "fare_detail", "fare_estimated", "leg_sequence",
+    ]
+    for v in vot_levels:
+        full += [f"generalized_time_hours_{v}", f"generalized_speed_mph_{v}"]
 
-    full = out / "transit_generalized_metrics_full.csv"
-    df.to_csv(full, index=False)
-    print(f"\nFull results       -> {full}")
-
-    valid = df[df["is_valid"]].copy()
-    essential = [
+    clean = [
         "origin_taz", "destination_taz", "dest_classification",
         "travel_distance_miles",
         "access_time_mins", "travel_time_mins", "modal_speed_mph",
         "fare", "boardings", "transfers_used", "fare_estimated",
         "leg_sequence",
     ]
-    for vot in VOT_LEVELS:
-        essential += [f"generalized_time_hours_{vot}",
-                      f"generalized_speed_mph_{vot}"]
-    clean = out / "transit_generalized_metrics_clean.csv"
-    valid[essential].to_csv(clean, index=False)
-    print(f"Clean results      -> {clean}")
-
-    invalid = df[~df["is_valid"]].copy()
-    if len(invalid):
-        ipath = out / "transit_invalid_pairs.csv"
-        invalid.to_csv(ipath, index=False)
-        print(f"Invalid pairs      -> {ipath}")
+    for v in vot_levels:
+        clean += [f"generalized_time_hours_{v}", f"generalized_speed_mph_{v}"]
+    return full, clean
 
 
-def generate_statistics(df: pd.DataFrame):
+@dataclass
+class Stats:
+    total: int = 0
+    valid: int = 0
+    invalid: int = 0
+    fare_estimated: int = 0
+    fare_sum: float = 0.0
+    fares: List[float] = field(default_factory=list)  # for median (reservoir-ish)
+    boardings_sum: int = 0
+    transfers_sum: int = 0
+    fare_max: float = 0.0
+    access_sum: float = 0.0
+    travel_sum: float = 0.0
+    modal_speed_sum: float = 0.0
+    gt_sum: Dict[str, float] = field(default_factory=dict)
+    gs_sum: Dict[str, float] = field(default_factory=dict)
+
+    def update(self, row: Dict[str, object], vot_levels: Dict[str, float]):
+        self.total += 1
+        if row["is_valid"]:
+            self.valid += 1
+            if row["fare_estimated"]:
+                self.fare_estimated += 1
+            f = float(row["fare"])
+            self.fare_sum += f
+            self.fares.append(f)
+            self.fare_max = max(self.fare_max, f)
+            self.boardings_sum += int(row["boardings"])
+            self.transfers_sum += int(row["transfers_used"])
+            self.access_sum += float(row["access_time_mins"])
+            self.travel_sum += float(row["travel_time_mins"])
+            if row["modal_speed_mph"] != "":
+                self.modal_speed_sum += float(row["modal_speed_mph"])
+            for v in vot_levels:
+                self.gt_sum[v] = self.gt_sum.get(v, 0.0) + float(
+                    row[f"generalized_time_hours_{v}"])
+                gs = row[f"generalized_speed_mph_{v}"]
+                if gs != "":
+                    self.gs_sum[v] = self.gs_sum.get(v, 0.0) + float(gs)
+        else:
+            self.invalid += 1
+
+
+class StreamingWriter:
+    """Append-mode CSV writer with a row buffer to keep disk I/O cheap."""
+
+    def __init__(self, path: Path, columns: List[str], buffer_size: int = 5000):
+        self.path = path
+        self.columns = columns
+        self.buffer_size = buffer_size
+        self.buffer: List[Dict[str, object]] = []
+        self._header_written = False
+        if path.exists():
+            path.unlink()  # fresh start
+
+    def write(self, row: Dict[str, object]):
+        self.buffer.append(row)
+        if len(self.buffer) >= self.buffer_size:
+            self.flush()
+
+    def flush(self):
+        if not self.buffer:
+            return
+        mode = "a" if self._header_written else "w"
+        with open(self.path, mode, newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=self.columns,
+                                    extrasaction="ignore")
+            if not self._header_written:
+                writer.writeheader()
+                self._header_written = True
+            writer.writerows(self.buffer)
+        self.buffer.clear()
+
+    def close(self):
+        self.flush()
+
+
+def process_streaming(json_dirs: Iterable[str],
+                      csv_fallback_path: Optional[str],
+                      metra_stations: List[MetraStation],
+                      zone_classifications: Dict[float, str],
+                      vot_levels: Dict[str, float],
+                      output_dir: str) -> Stats:
+    """
+    Stream JSON files one at a time, compute per-pair metrics, and append to
+    disk. Avoids holding the full ~8.5M-pair dataset in memory.
+
+    Dedup policy: first sighting of an (origin, dest) wins. Since we walk
+    `json_dirs` in the order given, pass higher-priority dirs first to match
+    combine_json_to_csv.py precedence.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    full_cols, clean_cols = _output_columns(vot_levels)
+    full_path    = out / "transit_generalized_metrics_full.csv"
+    clean_path   = out / "transit_generalized_metrics_clean.csv"
+    invalid_path = out / "transit_invalid_pairs.csv"
+
+    w_full  = StreamingWriter(full_path,    full_cols)
+    w_clean = StreamingWriter(clean_path,   clean_cols)
+    w_inv   = StreamingWriter(invalid_path, full_cols)
+
+    seen: set = set()
+    stats = Stats()
+
+    # --- Phase 1: JSON files, one at a time -----------------------------------
+    files_seen = 0
+    t0 = time.time()
+    last_report = t0
+
+    for jpath in _iter_json_files(json_dirs):
+        files_seen += 1
+        try:
+            with open(jpath, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  [warn] could not read {jpath.name}: {e}")
+            continue
+
+        new_rows = 0
+        for rec in _iter_records(payload):
+            o, d = _record_od(rec)
+            if o is None or d is None:
+                continue
+            key = (o, d)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            pattern = _extract_pattern(rec)
+            ts = summarize_trip(pattern, metra_stations, None, None) if pattern else None
+            row = _build_row(o, d, ts, zone_classifications, vot_levels)
+            stats.update(row, vot_levels)
+            w_full.write(row)
+            if row["is_valid"]:
+                w_clean.write(row)
+            else:
+                w_inv.write(row)
+            new_rows += 1
+
+        # Release the payload immediately; don't keep leg data around.
+        del payload
+
+        now = time.time()
+        if now - last_report > 5.0 or files_seen % 50 == 0:
+            elapsed = now - t0
+            rate = stats.total / elapsed if elapsed > 0 else 0
+            print(f"  [{files_seen:>5} files | {stats.total:>9,} pairs | "
+                  f"{rate:>6.0f} pairs/s | {elapsed:>6.1f}s]")
+            last_report = now
+
+    print(f"  Scanned {files_seen} JSON file(s); produced {stats.total:,} OD pairs")
+
+    # --- Phase 2: CSV fallback for any OD pair not seen in JSON ---------------
+    if csv_fallback_path and os.path.exists(csv_fallback_path):
+        print(f"\nScanning CSV fallback: {csv_fallback_path}")
+        # Read in chunks — don't load the full 8.5M-row CSV at once.
+        reader = pd.read_csv(csv_fallback_path, chunksize=200_000)
+        added = 0
+        for chunk in reader:
+            col_o = "origin_taz"
+            col_d = ("destination_taz" if "destination_taz" in chunk.columns
+                     else "dest_taz")
+            col_dist = ("travel_distance_miles"
+                        if "travel_distance_miles" in chunk.columns
+                        else "distance_miles")
+            col_time = ("travel_time_mins" if "travel_time_mins" in chunk.columns
+                        else "travel_time_min")
+            for _, r in chunk.iterrows():
+                o, d = r[col_o], r[col_d]
+                key = (o, d)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ts = summarize_trip(None, metra_stations,
+                                    r.get(col_dist), r.get(col_time))
+                row = _build_row(o, d, ts, zone_classifications, vot_levels)
+                stats.update(row, vot_levels)
+                w_full.write(row)
+                if row["is_valid"]:
+                    w_clean.write(row)
+                else:
+                    w_inv.write(row)
+                added += 1
+        print(f"  CSV fallback added {added:,} pairs not seen in JSON")
+
+    w_full.close(); w_clean.close(); w_inv.close()
+
+    print(f"\nFull results       -> {full_path}")
+    print(f"Clean results      -> {clean_path}")
+    print(f"Invalid pairs      -> {invalid_path}")
+    return stats
+
+
+def print_stats(stats: Stats, vot_levels: Dict[str, float]):
     print("\n" + "=" * 80)
     print("TRANSIT SUMMARY STATISTICS")
     print("=" * 80)
-    valid = df[df["is_valid"]]
-    print(f"Total OD pairs:        {len(df):,}")
-    print(f"Valid:                 {len(valid):,}")
-    print(f"Invalid:               {len(df) - len(valid):,}")
-    if not len(valid):
+    print(f"Total OD pairs:        {stats.total:,}")
+    print(f"Valid:                 {stats.valid:,}")
+    print(f"Invalid:               {stats.invalid:,}")
+    if stats.valid == 0:
         return
-    print(f"Fare-estimated pairs:  {valid['fare_estimated'].sum():,}")
-    print(f"Mean boardings/trip:   {valid['boardings'].mean():.2f}")
-    print(f"Mean transfers/trip:   {valid['transfers_used'].mean():.2f}")
-    print(f"Mean fare:             ${valid['fare'].mean():.2f}")
-    print(f"Median fare:           ${valid['fare'].median():.2f}")
-    print(f"Max fare:              ${valid['fare'].max():.2f}")
-    print(f"Mean access time:      {valid['access_time_mins'].mean():.1f} min")
-    print(f"Mean travel time:      {valid['travel_time_mins'].mean():.1f} min")
-    print(f"Mean modal speed:      {valid['modal_speed_mph'].mean():.2f} mph")
-    for vot_name, vot in VOT_LEVELS.items():
-        gs = valid[f"generalized_speed_mph_{vot_name}"]
-        gt = valid[f"generalized_time_hours_{vot_name}"]
+    median_fare = float(np.median(stats.fares)) if stats.fares else float("nan")
+    print(f"Fare-estimated pairs:  {stats.fare_estimated:,}")
+    print(f"Mean boardings/trip:   {stats.boardings_sum / stats.valid:.2f}")
+    print(f"Mean transfers/trip:   {stats.transfers_sum / stats.valid:.2f}")
+    print(f"Mean fare:             ${stats.fare_sum / stats.valid:.2f}")
+    print(f"Median fare:           ${median_fare:.2f}")
+    print(f"Max fare:              ${stats.fare_max:.2f}")
+    print(f"Mean access time:      {stats.access_sum / stats.valid:.1f} min")
+    print(f"Mean travel time:      {stats.travel_sum / stats.valid:.1f} min")
+    print(f"Mean modal speed:      {stats.modal_speed_sum / stats.valid:.2f} mph")
+    for vot_name, vot in vot_levels.items():
+        gt_mean = stats.gt_sum.get(vot_name, 0.0) / stats.valid
+        gs_mean = stats.gs_sum.get(vot_name, 0.0) / stats.valid
         print(f"\nVoT {vot_name} (${vot}/hr):")
-        print(f"  gen speed mean: {gs.mean():.2f} mph   "
-              f"gen time mean:  {gt.mean()*60:.1f} min")
+        print(f"  gen speed mean: {gs_mean:.2f} mph   "
+              f"gen time mean:  {gt_mean*60:.1f} min")
 
 
 def main():
@@ -981,14 +1096,17 @@ def main():
               "destinations will be marked 'Unknown'.")
     metra_stations = load_metra_stations(args.metra_stations, args.taz_file)
 
-    print("\n--- Loading OTP JSON ---")
-    json_pairs = load_transit_pairs_from_json(json_dirs)
+    print("\n--- Streaming OTP JSON -> CSV ---")
+    stats = process_streaming(
+        json_dirs=json_dirs,
+        csv_fallback_path=args.transit_csv,
+        metra_stations=metra_stations,
+        zone_classifications=zone_class,
+        vot_levels=VOT_LEVELS,
+        output_dir=args.output_dir,
+    )
 
-    df = build_dataframe(json_pairs, args.transit_csv, metra_stations)
-    df = calculate_generalized_metrics(df, zone_class, VOT_LEVELS)
-
-    generate_statistics(df)
-    save_outputs(df, args.output_dir)
+    print_stats(stats, VOT_LEVELS)
 
     print("\n" + "=" * 80)
     print("Processing complete!")
