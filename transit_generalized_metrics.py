@@ -166,7 +166,14 @@ OHARE_STATION_KEYWORDS = ("O'HARE", "OHARE", "O HARE")
 # --- Default file paths (overridable on the CLI) ---
 DEFAULT_TAZ_FILE        = "taz_new.csv"   # zone17, chicago, cbd, Lat, Lon
 DEFAULT_METRA_STATIONS  = "transit_meta/metrastations_taz.xls"
-DEFAULT_TRANSIT_CSV     = "TAZ_OTP/data/csv/travel_time_transit.csv"
+# Candidate locations for the aggregate transit CSV — tried in order.
+# Pass --transit-csv explicitly to override.
+DEFAULT_TRANSIT_CSV_CANDIDATES = [
+    "travel_time_transit.csv",
+    "TAZ_OTP/data/csv/travel_time_transit.csv",
+    "data/csv/travel_time_transit.csv",
+    "csv/travel_time_transit.csv",
+]
 DEFAULT_JSON_DIRS       = [
     "TAZ_OTP/data/transit-arrive-9AM",   # higher priority (recollected)
     "TAZ_OTP/data/arrive-9AM",
@@ -951,7 +958,6 @@ def process_streaming(json_dirs: Iterable[str],
             print(f"  [warn] could not read {jpath.name}: {e}")
             continue
 
-        new_rows = 0
         for rec in _iter_records(payload):
             o, d = _record_od(rec)
             if o is None or d is None:
@@ -959,10 +965,16 @@ def process_streaming(json_dirs: Iterable[str],
             key = (o, d)
             if key in seen:
                 continue
-            seen.add(key)
 
+            # Only mark as seen (and write) when OTP returned a usable trip.
+            # Records with success=False, trip_patterns=[], or wrong mode are
+            # skipped here so the CSV fallback can still fill them in.
             pattern = _extract_pattern(rec)
-            ts = summarize_trip(pattern, metra_stations, None, None) if pattern else None
+            if pattern is None:
+                continue
+
+            seen.add(key)
+            ts = summarize_trip(pattern, metra_stations, None, None)
             row = _build_row(o, d, ts, zone_classifications, vot_levels)
             stats.update(row, vot_levels)
             w_full.write(row)
@@ -970,7 +982,6 @@ def process_streaming(json_dirs: Iterable[str],
                 w_clean.write(row)
             else:
                 w_inv.write(row)
-            new_rows += 1
 
         # Release the payload immediately; don't keep leg data around.
         del payload
@@ -1063,8 +1074,10 @@ def main():
                          "used for Metra station coordinate lookup.")
     ap.add_argument("--metra-stations", default=DEFAULT_METRA_STATIONS,
                     help="metrastations_taz.xls (STATION_ID, FAREZONE, zone17, ...)")
-    ap.add_argument("--transit-csv",    default=DEFAULT_TRANSIT_CSV,
-                    help="Aggregate transit CSV fallback (origin_taz, dest_taz, distance, time)")
+    ap.add_argument("--transit-csv",    default=None,
+                    help="Aggregate transit CSV (origin_taz, destination_taz, "
+                         "travel_distance_miles, travel_time_mins). If omitted "
+                         "the script searches common locations automatically.")
     ap.add_argument("--json-dir", action="append", default=None,
                     help="Directory of OTP JSON files. Repeat to add multiple "
                          "(earlier dirs take priority on duplicates).")
@@ -1072,6 +1085,22 @@ def main():
     args = ap.parse_args()
 
     json_dirs = args.json_dir or DEFAULT_JSON_DIRS
+
+    # Resolve CSV fallback path: explicit arg wins, else auto-detect
+    transit_csv_path: Optional[str] = args.transit_csv
+    if transit_csv_path is None:
+        for candidate in DEFAULT_TRANSIT_CSV_CANDIDATES:
+            if os.path.exists(candidate):
+                transit_csv_path = candidate
+                break
+    if transit_csv_path and os.path.exists(transit_csv_path):
+        print(f"[info] Transit CSV fallback: {transit_csv_path}")
+    else:
+        print("[WARN] No transit CSV fallback found. Pairs with empty/failed "
+              "JSON entries will be marked invalid instead of using CSV data.")
+        print("       Pass --transit-csv <path/to/travel_time_transit.csv> to "
+              "enable the fallback and recover those ~4M extra pairs.")
+        transit_csv_path = None
 
     print("=" * 80)
     print("TRANSIT MODE GENERALIZED METRICS CALCULATOR")
@@ -1099,7 +1128,7 @@ def main():
     print("\n--- Streaming OTP JSON -> CSV ---")
     stats = process_streaming(
         json_dirs=json_dirs,
-        csv_fallback_path=args.transit_csv,
+        csv_fallback_path=transit_csv_path,
         metra_stations=metra_stations,
         zone_classifications=zone_class,
         vot_levels=VOT_LEVELS,
