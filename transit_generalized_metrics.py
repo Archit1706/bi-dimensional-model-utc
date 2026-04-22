@@ -884,13 +884,15 @@ class Stats:
 class StreamingWriter:
     """Append-mode CSV writer with a row buffer to keep disk I/O cheap."""
 
-    def __init__(self, path: Path, columns: List[str], buffer_size: int = 5000):
+    def __init__(self, path: Path, columns: List[str],
+                 buffer_size: int = 5000, resume: bool = False):
         self.path = path
         self.columns = columns
         self.buffer_size = buffer_size
         self.buffer: List[Dict[str, object]] = []
-        self._header_written = False
-        if path.exists():
+        # On resume the file already exists and has a header — don't rewrite it.
+        self._header_written = resume and path.exists()
+        if not resume and path.exists():
             path.unlink()  # fresh start
 
     def write(self, row: Dict[str, object]):
@@ -915,12 +917,34 @@ class StreamingWriter:
         self.flush()
 
 
+def _rebuild_seen_from_output(full_path: Path) -> set:
+    """
+    Read only the (origin_taz, destination_taz) columns from an existing
+    full-output CSV to rebuild the seen set for a resume run.
+    Chunked so the read stays memory-bounded regardless of file size.
+    """
+    seen: set = set()
+    if not full_path.exists():
+        return seen
+    print(f"  Rebuilding seen set from existing output: {full_path}")
+    rows_read = 0
+    for chunk in pd.read_csv(full_path,
+                             usecols=["origin_taz", "destination_taz"],
+                             chunksize=200_000):
+        for o, d in zip(chunk["origin_taz"], chunk["destination_taz"]):
+            seen.add((o, d))
+        rows_read += len(chunk)
+    print(f"  Loaded {rows_read:,} already-processed pairs — will skip these")
+    return seen
+
+
 def process_streaming(json_dirs: Iterable[str],
                       csv_fallback_path: Optional[str],
                       metra_stations: List[MetraStation],
                       zone_classifications: Dict[float, str],
                       vot_levels: Dict[str, float],
-                      output_dir: str) -> Stats:
+                      output_dir: str,
+                      resume: bool = False) -> Stats:
     """
     Stream JSON files one at a time, compute per-pair metrics, and append to
     disk. Avoids holding the full ~8.5M-pair dataset in memory.
@@ -928,6 +952,10 @@ def process_streaming(json_dirs: Iterable[str],
     Dedup policy: first sighting of an (origin, dest) wins. Since we walk
     `json_dirs` in the order given, pass higher-priority dirs first to match
     combine_json_to_csv.py precedence.
+
+    If resume=True, the existing output files are kept and the seen set is
+    pre-populated from the full-output CSV so already-processed pairs are
+    skipped efficiently.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -937,11 +965,14 @@ def process_streaming(json_dirs: Iterable[str],
     clean_path   = out / "transit_generalized_metrics_clean.csv"
     invalid_path = out / "transit_invalid_pairs.csv"
 
-    w_full  = StreamingWriter(full_path,    full_cols)
-    w_clean = StreamingWriter(clean_path,   clean_cols)
-    w_inv   = StreamingWriter(invalid_path, full_cols)
+    # On resume, pre-populate seen from the existing full output before opening
+    # any writers (so we don't accidentally wipe the file before reading it).
+    seen: set = _rebuild_seen_from_output(full_path) if resume else set()
 
-    seen: set = set()
+    w_full  = StreamingWriter(full_path,    full_cols,  resume=resume)
+    w_clean = StreamingWriter(clean_path,   clean_cols, resume=resume)
+    w_inv   = StreamingWriter(invalid_path, full_cols,  resume=resume)
+
     stats = Stats()
 
     # --- Phase 1: JSON files, one at a time -----------------------------------
@@ -1082,6 +1113,11 @@ def main():
                     help="Directory of OTP JSON files. Repeat to add multiple "
                          "(earlier dirs take priority on duplicates).")
     ap.add_argument("--output-dir",     default=DEFAULT_OUTPUT_DIR)
+    ap.add_argument("--resume", action="store_true",
+                    help="Continue a previous run that crashed or was interrupted. "
+                         "Reads already-processed (origin, dest) pairs from the "
+                         "existing full-output CSV and skips them. Output files "
+                         "are opened in append mode.")
     args = ap.parse_args()
 
     json_dirs = args.json_dir or DEFAULT_JSON_DIRS
@@ -1125,6 +1161,8 @@ def main():
               "destinations will be marked 'Unknown'.")
     metra_stations = load_metra_stations(args.metra_stations, args.taz_file)
 
+    if args.resume:
+        print("\n--- RESUME MODE: continuing previous run ---")
     print("\n--- Streaming OTP JSON -> CSV ---")
     stats = process_streaming(
         json_dirs=json_dirs,
@@ -1133,6 +1171,7 @@ def main():
         zone_classifications=zone_class,
         vot_levels=VOT_LEVELS,
         output_dir=args.output_dir,
+        resume=args.resume,
     )
 
     print_stats(stats, VOT_LEVELS)
